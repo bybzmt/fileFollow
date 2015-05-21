@@ -176,20 +176,24 @@ func syncAndSendFile(r *http.Request) (http.File, error) {
 		return nil, os.ErrNotExist
 	}
 
-	if *followModifyTime == "on" {
-		t, err := time.Parse(http.TimeFormat, resp.Header.Get("Last-Modified"))
-		if  err == nil {
+	var t2 *time.Time
+
+	t, err := time.Parse(http.TimeFormat, resp.Header.Get("Last-Modified"))
+	if  err == nil {
+		if *followModifyTime == "on" {
 			//缓存时间
 			modifiedLock.Lock()
 			modifiedCache.Add(name, t)
 			modifiedLock.Unlock()
 		}
+
+		t2 = &t
 	}
 
-	return saveFile(resp.Body, name)
+	return saveFile(resp.Body, name, t2)
 }
 
-func saveFile(r io.Reader, filename string) (http.File, error) {
+func saveFile(r io.Reader, filename string, t *time.Time) (http.File, error) {
 	name := path.Join(*base, filename)
 
 	//创建文件夹
@@ -219,6 +223,11 @@ func saveFile(r io.Reader, filename string) (http.File, error) {
 		f.Close()
 		os.Remove(name)
 		return nil, err
+	}
+
+	err = os.Chtimes(name, *t, *t)
+	if err != nil {
+		log.Println("Chtimes", err)
 	}
 
 	_, err = f.Seek(0, os.SEEK_SET)
