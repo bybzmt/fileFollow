@@ -225,9 +225,11 @@ func saveFile(r io.Reader, filename string, t *time.Time) (http.File, error) {
 		return nil, err
 	}
 
-	err = os.Chtimes(name, *t, *t)
-	if err != nil {
-		log.Println("Chtimes", err)
+	if t != nil {
+		err = os.Chtimes(name, *t, *t)
+		if err != nil {
+			log.Println("Chtimes", err)
+		}
 	}
 
 	_, err = f.Seek(0, os.SEEK_SET)
