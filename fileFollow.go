@@ -5,241 +5,210 @@ import (
 	"path"
 	"net/http"
 	"net/url"
+	"net/http/httputil"
 	"runtime"
 	"flag"
-	"strings"
+	//"strings"
 	"log"
 	"sync"
 	"sync/atomic"
 	"io"
+	"io/ioutil"
+	"bufio"
 	"time"
-	"strconv"
-	"container/list"
+	//"strconv"
+	//"container/list"
+	"gopkg.in/fsnotify.v1"
 )
 
-var addr = flag.String("addr", "", "listen addr")
-var follow = flag.String("follow", "", "follow addr")
+var addr = flag.String("listen", ":80", "listen addr")
 var base = flag.String("dir", ".", "Run on dir")
-var syncfile = flag.String("sync", "off", "sync file on/off")
-var followModifyTime = flag.String("followTime", "off", "follow master last modify time on/off")
-var lastModifiedCacheLen = flag.Int("cache", 10000, "last modify time cache len")
-var statusTime = flag.Int("info", 300, "Print Status Time (Second)")
+var follow = flag.String("follow", "", "Follow master server URL")
+var syncMode = flag.String("sync", "none", "File Sync Mode. (none/lazy/active/nodel)")
+var statusTime = flag.Int("info", 300, "Print a status message every N*second.")
 
 var fileSystem http.Dir
 var followURL url.URL
-
-var request_num int64
 var status_time time.Duration
+var notDelFile = false
+
+//状态计数
+var request_num int64
+var inotify_event_num int64
+var file_sync_num int64
 
 func main() {
 	flag.Parse()
 
+	//初史化输入参数
 	fileSystem = http.Dir(*base)
-
-	runtime.GOMAXPROCS(runtime.NumCPU())
-
 	status_time = time.Duration(*statusTime)
 
-	if *follow == "" {
-		http.HandleFunc("/", masterServer)
-	} else {
-		//添加http
-		if !strings.HasPrefix(*follow, "http") {
-			*follow = "http://" + *follow
-		}
-
+	if *follow != "" {
 		_url, err := url.Parse(*follow)
 		if err != nil {
 			log.Fatal("follow", err)
 		}
-		followURL = *_url
-
-		if *syncfile == "on" {
-			if *followModifyTime == "on" {
-				go lastModifiedCacheStatus()
-			}
-			http.HandleFunc("/", syncServer)
-		} else {
-			http.HandleFunc("/", proxyServer)
+		if _url.Scheme == "" {
+			_url.Scheme = "http"
 		}
+		followURL = *_url
 	}
 
+	runtime.GOMAXPROCS(runtime.NumCPU() * 2)
+
+	//打印状态信息
 	go requestStatus()
+
+	if *follow == "" {
+		log.Println("Run on master mode.")
+		http.HandleFunc("/", masterServer)
+	} else {
+		log.Println("Run on slave mode. follow", followURL.String())
+
+		switch *syncMode {
+		case "none" :
+			http.HandleFunc("/", proxyServer)
+		case "nodel" :
+			notDelFile = true
+			fallthrough
+		case "active" :
+			go followMasterInotify()
+			fallthrough
+		case "lazy" :
+			http.HandleFunc("/", syncServer)
+		default:
+			log.Fatal("Sync mode undefined!")
+		}
+
+		log.Println("File sync mode " + *syncMode + ".")
+	}
 
 	log.Fatal(http.ListenAndServe(*addr, nil))
 }
 
 //主服务器
 func masterServer(w http.ResponseWriter, r *http.Request) {
+	if r.Method == "INOTIFY" {
+		masterInotify(w, r)
+		return
+	}
+
 	atomic.AddInt64(&request_num, 1)
 
 	f, err := fileSystem.Open(r.URL.Path)
 	if err != nil {
-		http.NotFound(w, r)
+		http.Error(w, err.Error(), http.StatusNotFound)
 		return
 	}
 	defer f.Close()
 
-	d, err2 := f.Stat()
-	if err2 != nil {
-		http.Error(w, err2.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	//禁止访问文件夹
-	if d.IsDir() {
-		http.Error(w, "403 Forbidden", http.StatusForbidden)
-		return
-	}
-
-	http.ServeContent(w, r, d.Name(), d.ModTime(), f)
+	serveContent(w, r, f)
 }
 
-//文件同步功能
-func syncServer(w http.ResponseWriter, r *http.Request) {
-	atomic.AddInt64(&request_num, 1)
-
-	f, err := fileSystem.Open(r.URL.Path)
+func masterInotify(w http.ResponseWriter, r *http.Request) {
+	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
-		if os.IsNotExist(err) {
-			f, err = syncAndSendFile(r)
-			if err != nil {
-				if os.IsNotExist(err) {
-					http.NotFound(w, r)
-				} else {
-					http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		log.Println(err)
+		return
+	}
+	defer watcher.Close()
+
+	basepath := path.Join(string(fileSystem), r.URL.Path)
+
+	err = watcher.Add(basepath)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		log.Println(err)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+
+	hj, ok := w.(http.Hijacker)
+    if !ok {
+		http.Error(w, "Upgrade Error", http.StatusPreconditionFailed)
+		return
+    }
+
+	conn, buf, err := hj.Hijack()
+    if err != nil {
+		http.Error(w, err.Error(), http.StatusPreconditionFailed)
+		return
+    }
+	defer conn.Close()
+
+	bw := httputil.NewChunkedWriter(buf)
+	defer bw.Close()
+
+	events = make([]fsnotify.event)
+
+	tick := time.Tick(5 * time.Second)
+	for {
+		select {
+		case _ = <-tick :
+			atomic.AddInt64(&inotify_event_num, 1)
+
+			if len(events) == 0 {
+				if _, err := io.WriteString(bw, "PING\n"); err != nil {
+					return
 				}
+			} else {
+				files := make(map[string][]string)
+				queue := []string
+
+				for _, event := range events {
+					evt, ok := files[event.Name]
+					if !ok {
+						queue = append(queue, event.Name)
+					}
+
+					if event.Op & fsnotify.Create == fsnotify.Create ||
+						event.Op & fsnotify.Write == fsnotify.Write {
+						if len(evt) == 0 || evt[len(evt) - 1] != "SYNC" {
+							evt = append(evt, "SYNC")
+						}
+					}
+
+					if event.Op & fsnotify.Remove == fsnotify.Remove ||
+						event.Op & fsnotify.Rename == fsnotify.Rename {
+						if len(evt) == 0 || evt[len(evt) - 1] != "REMOVE" {
+							evt = append(evt, "REMOVE")
+						}
+					}
+				}
+			}
+
+			if err := buf.Flush(); err != nil {
 				return
 			}
-		} else {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
+		case event := <-watcher.Events:
+			events = append(events, event)
+		case err := <-watcher.Errors:
+			log.Println("inotify error:", err)
 		}
 	}
-	defer f.Close()
-
-	//禁止访问文件夹 start
-	d, err2 := f.Stat()
-	if err2 != nil {
-		http.Error(w, err2.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	if d.IsDir() {
-		http.Error(w, "403 Forbidden", http.StatusForbidden)
-		return
-	}
-	//禁止访问文件夹 end
-
-	basename := path.Base(r.URL.Path)
-	var modtime time.Time
-
-	if *followModifyTime == "on" {
-		modtime, err = getMasterLastModified(r)
-		if err != nil {
-			http.NotFound(w, r)
-			return
-		}
-	} else {
-		modtime = d.ModTime()
-	}
-
-	http.ServeContent(w, r, basename, modtime, f)
 }
 
-func syncAndSendFile(r *http.Request) (http.File, error) {
-	name := path.Clean(r.URL.Path)
-
-	//加锁
-	l := getLocker(name)
-	l.Lock()
-	defer l.Unlock()
-
-	//再次检查文件是否存在
-	f, err := fileSystem.Open(name)
-	if err == nil {
-		return f, nil
+func eventToString(evt fsnotify.Event) (msg []string) {
+	//我们只关心下面这几种事件
+	//每个事件1行进行输出
+	if evt.Op & fsnotify.Create == fsnotify.Create {
+		msg = append("CREATE:" + evt.Name)
 	}
-
-	_url := followURL
-	_url.Path = path.Join(_url.Path, name)
-	_url.RawQuery = r.URL.RawQuery
-
-	resp, err := http.Get(_url.String())
-	if err != nil {
-		return nil, err
+	if evt.Op & fsnotify.Remove == fsnotify.Remove {
+		msg = append("REMOVE:" + evt.Name)
 	}
-
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		return nil, os.ErrNotExist
+	if evt.Op & fsnotify.Write == fsnotify.Write {
+		msg = append("WRITE:" + evt.Name)
 	}
-
-	var t2 *time.Time
-
-	t, err := time.Parse(http.TimeFormat, resp.Header.Get("Last-Modified"))
-	if  err == nil {
-		if *followModifyTime == "on" {
-			//缓存时间
-			modifiedLock.Lock()
-			modifiedCache.Add(name, t)
-			modifiedLock.Unlock()
-		}
-
-		t2 = &t
+	if evt.Op & fsnotify.Rename == fsnotify.Rename {
+		msg = append("RENAME:" + evt.Name)
 	}
-
-	return saveFile(resp.Body, name, t2)
+	return
 }
-
-func saveFile(r io.Reader, filename string, t *time.Time) (http.File, error) {
-	name := path.Join(*base, filename)
-
-	//创建文件夹
-	dir := path.Dir(name)
-	err := os.MkdirAll(dir, 0777)
-	if err != nil {
-		return nil, err
-	}
-
-	//创建文件
-	f, err2 := os.Create(name)
-	if err2 != nil {
-		return nil, err
-	}
-
-	_, err = io.Copy(f, r)
-	if err != nil {
-		//删除错误的文件
-		f.Close()
-		os.Remove(name)
-		return nil, err
-	}
-
-	err = f.Sync()
-	if err != nil {
-		//删除错误的文件
-		f.Close()
-		os.Remove(name)
-		return nil, err
-	}
-
-	if t != nil {
-		err = os.Chtimes(name, *t, *t)
-		if err != nil {
-			log.Println("Chtimes", err)
-		}
-	}
-
-	_, err = f.Seek(0, os.SEEK_SET)
-	if err != nil {
-		f.Close()
-		return nil, err
-	}
-
-	return f, nil
-}
+//主服务器 结束
 
 //直接转发请求
 func proxyServer(w http.ResponseWriter, r *http.Request) {
@@ -267,81 +236,169 @@ func proxyServer(w http.ResponseWriter, r *http.Request) {
 
 	io.Copy(w, resp.Body)
 }
+//直接转发请求 结束
 
-var modifiedLock sync.Mutex
-var modifiedCache = newCache(*lastModifiedCacheLen)
-var modifiedCacheHit int64
-var modifiedCacheMiss int64
+//带文件同步服务
+func syncServer(w http.ResponseWriter, r *http.Request) {
+	atomic.AddInt64(&request_num, 1)
 
-//读取主服器时间
-func getMasterLastModified(r *http.Request) (t time.Time, err error) {
+	f, err := fileSystem.Open(r.URL.Path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			f, err = syncAndSaveFile(r)
+			if err != nil {
+				if os.IsNotExist(err) {
+					http.NotFound(w, r)
+				} else {
+					http.Error(w, err.Error(), http.StatusInternalServerError)
+				}
+				return
+			}
+		} else {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+	}
+	defer f.Close()
+
+	serveContent(w, r, f)
+}
+
+func syncAndSaveFile(r *http.Request) (http.File, error) {
 	name := path.Clean(r.URL.Path)
 
-	//读缓存
-	modifiedLock.Lock()
-	tmp, has := modifiedCache.Get(name)
-	modifiedLock.Unlock()
-	if has {
-		atomic.AddInt64(&modifiedCacheHit, 1)
-		return tmp, nil
+	//加锁
+	l := getLocker(name)
+	l.Lock()
+	defer l.Unlock()
+
+	//再次检查文件是否存在
+	if f, err := fileSystem.Open(name); err == nil {
+		return f, nil
 	}
 
-	atomic.AddInt64(&modifiedCacheMiss, 1)
-
 	_url := followURL
-	_url.Path = path.Join(_url.Path, r.URL.Path)
+	_url.Path = path.Join(_url.Path, name)
 	_url.RawQuery = r.URL.RawQuery
 
-	resp, err2 := http.Head(_url.String())
-	if err2 != nil {
-		err = err2
-		return
+	resp, err := http.Get(_url.String())
+	if err != nil {
+		return nil, err
 	}
 
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		err = os.ErrNotExist
+		return nil, os.ErrNotExist
+	}
+
+	//尝试获取文件最后更改时间
+	t, _ := time.Parse(http.TimeFormat, resp.Header.Get("Last-Modified"))
+
+	err = saveFile(name, t, resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	return fileSystem.Open(name)
+}
+
+func saveFile(filename string, t time.Time, r io.Reader) error {
+	name := path.Join(string(fileSystem), filename)
+
+	//创建文件夹
+	dir := path.Dir(name)
+	err := os.MkdirAll(dir, 0777)
+	if err != nil {
+		return err
+	}
+
+	//创建文件
+	f, err := os.Create(name)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	if _, err := io.Copy(f, r); err != nil {
+		os.Remove(name)
+		return err
+	}
+
+	if err := f.Sync(); err != nil {
+		os.Remove(name)
+		return err
+	}
+
+	if t.Unix() > 0 {
+		if err := os.Chtimes(name, t, t); err != nil {
+			os.Remove(name)
+			return err
+		}
+	}
+
+	return nil
+}
+//带文件同步服务 结束
+
+//跟随master文件inotify
+func followMasterInotify() {
+	_url := followURL
+
+	req, err := http.NewRequest("INOTIFY", _url.String(), nil)
+	if err != nil {
+		log.Println(err)
 		return
 	}
 
-	t, err = time.Parse(http.TimeFormat, resp.Header.Get("Last-Modified"))
-
-	if  err == nil {
-		//缓存时间
-		modifiedLock.Lock()
-		modifiedCache.Add(name, t)
-		modifiedLock.Unlock()
+	resp, err := new(http.Client).Do(req)
+	if err != nil {
+		log.Println(err)
+		return
 	}
 
-	return
-}
+	log.Println("Inotify link", _url.String())
+	defer log.Println("Inotify close")
 
-func lastModifiedCacheStatus() {
-	c := time.Tick(status_time * time.Second)
+	defer resp.Body.Close()
 
-	for _ = range c {
-		hit := atomic.SwapInt64(&modifiedCacheHit, 0)
-		miss := atomic.SwapInt64(&modifiedCacheMiss, 0)
+	if resp.StatusCode != 200 {
+		r2 := io.LimitReader(resp.Body, 4*1024*1024)
+		msg, _ := ioutil.ReadAll(r2)
+		log.Println(resp.Status, string(msg))
+		return
+	}
 
-		if hit > 0 || miss > 0 {
-			log.Println("Cache hit/miss:", hit, miss, strconv.Itoa(int(float64(hit) / float64(hit+miss)*100))+"%")
+	r := bufio.NewReader(resp.Body)
+	for {
+		event, err := r.ReadString('\n')
+		if err != nil {
+			log.Println(err)
+			return
 		}
+		log.Println(event)
 	}
 }
+//跟随master文件inotify 结束
 
+//输出状态信息
 func requestStatus() {
 	c := time.Tick(status_time * time.Second)
 
 	for _ = range c {
-		num := atomic.SwapInt64(&request_num, 0)
+		num1 := atomic.SwapInt64(&request_num, 0)
+		num2 := atomic.SwapInt64(&inotify_event_num, 0)
+		num3 := atomic.SwapInt64(&file_sync_num, 0)
 
-		log.Println("Request Num:", num)
+		if *follow == "" {
+			log.Println("RequestNum:", num1, "InotifyEventNum:", num2)
+		} else {
+			log.Println("RequestNum:", num1, "InotifyEventNum:", num2, "FileSyncNum:", num3)
+		}
 	}
 }
 
 /** locker start **/
-
 var lock sync.Mutex
 var locks = make(map[string]*locker)
 
@@ -381,85 +438,18 @@ func (l *locker) UnLock() {
 
 /** locker end **/
 
-/** lru start ****/
-
-type Cache struct {
-	MaxEntries int
-	ll    *list.List
-	cache map[string]*list.Element
-}
-
-type entry struct {
-	key   string
-	value time.Time
-}
-
-func newCache(maxEntries int) *Cache {
-	return &Cache{
-		MaxEntries: maxEntries,
-		ll:         list.New(),
-		cache:      make(map[string]*list.Element),
-	}
-}
-
-func (c *Cache) Add(key string, value time.Time) {
-	if c.cache == nil {
-		c.cache = make(map[string]*list.Element)
-		c.ll = list.New()
-	}
-	if ee, ok := c.cache[key]; ok {
-		c.ll.MoveToFront(ee)
-		ee.Value.(*entry).value = value
+func serveContent(w http.ResponseWriter, r *http.Request, f http.File) {
+	d, err2 := f.Stat()
+	if err2 != nil {
+		http.Error(w, err2.Error(), http.StatusInternalServerError)
 		return
 	}
-	ele := c.ll.PushFront(&entry{key, value})
-	c.cache[key] = ele
-	if c.MaxEntries != 0 && c.ll.Len() > c.MaxEntries {
-		c.RemoveOldest()
-	}
-}
 
-func (c *Cache) Get(key string) (value time.Time, ok bool) {
-	if c.cache == nil {
+	//禁止访问文件夹
+	if d.IsDir() {
+		http.Error(w, "403 Forbidden", http.StatusForbidden)
 		return
 	}
-	if ele, hit := c.cache[key]; hit {
-		c.ll.MoveToFront(ele)
-		return ele.Value.(*entry).value, true
-	}
-	return
-}
 
-func (c *Cache) Remove(key string) {
-	if c.cache == nil {
-		return
-	}
-	if ele, hit := c.cache[key]; hit {
-		c.removeElement(ele)
-	}
+	http.ServeContent(w, r, d.Name(), d.ModTime(), f)
 }
-
-func (c *Cache) RemoveOldest() {
-	if c.cache == nil {
-		return
-	}
-	ele := c.ll.Back()
-	if ele != nil {
-		c.removeElement(ele)
-	}
-}
-
-func (c *Cache) removeElement(e *list.Element) {
-	c.ll.Remove(e)
-	kv := e.Value.(*entry)
-	delete(c.cache, kv.key)
-}
-
-func (c *Cache) Len() int {
-	if c.cache == nil {
-		return 0
-	}
-	return c.ll.Len()
-}
-
-/** lru end ****/
