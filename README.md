@@ -21,7 +21,7 @@ fileFollow
 
 **sync**
 
-*	none 不同
+*	none 不同步
 *	layz 懒同步 只有当http请求到某个文件，并且本地不存在它时，才会去同步
 
 注意：
