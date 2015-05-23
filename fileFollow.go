@@ -5,26 +5,19 @@ import (
 	"path"
 	"net/http"
 	"net/url"
-	"net/http/httputil"
 	"runtime"
 	"flag"
-	//"strings"
 	"log"
 	"sync"
 	"sync/atomic"
 	"io"
-	"io/ioutil"
-	"bufio"
 	"time"
-	//"strconv"
-	//"container/list"
-	"gopkg.in/fsnotify.v1"
 )
 
 var addr = flag.String("listen", ":80", "listen addr")
 var base = flag.String("dir", ".", "Run on dir")
 var follow = flag.String("follow", "", "Follow master server URL")
-var syncMode = flag.String("sync", "none", "File Sync Mode. (none/lazy/active/nodel)")
+var syncMode = flag.String("sync", "none", "File Sync (none/lazy)")
 var statusTime = flag.Int("info", 300, "Print a status message every N*second.")
 
 var fileSystem http.Dir
@@ -69,12 +62,6 @@ func main() {
 		switch *syncMode {
 		case "none" :
 			http.HandleFunc("/", proxyServer)
-		case "nodel" :
-			notDelFile = true
-			fallthrough
-		case "active" :
-			go followMasterInotify()
-			fallthrough
 		case "lazy" :
 			http.HandleFunc("/", syncServer)
 		default:
@@ -89,11 +76,6 @@ func main() {
 
 //主服务器
 func masterServer(w http.ResponseWriter, r *http.Request) {
-	if r.Method == "INOTIFY" {
-		masterInotify(w, r)
-		return
-	}
-
 	atomic.AddInt64(&request_num, 1)
 
 	f, err := fileSystem.Open(r.URL.Path)
@@ -104,109 +86,6 @@ func masterServer(w http.ResponseWriter, r *http.Request) {
 	defer f.Close()
 
 	serveContent(w, r, f)
-}
-
-func masterInotify(w http.ResponseWriter, r *http.Request) {
-	watcher, err := fsnotify.NewWatcher()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		log.Println(err)
-		return
-	}
-	defer watcher.Close()
-
-	basepath := path.Join(string(fileSystem), r.URL.Path)
-
-	err = watcher.Add(basepath)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		log.Println(err)
-		return
-	}
-
-	w.WriteHeader(http.StatusOK)
-
-	hj, ok := w.(http.Hijacker)
-    if !ok {
-		http.Error(w, "Upgrade Error", http.StatusPreconditionFailed)
-		return
-    }
-
-	conn, buf, err := hj.Hijack()
-    if err != nil {
-		http.Error(w, err.Error(), http.StatusPreconditionFailed)
-		return
-    }
-	defer conn.Close()
-
-	bw := httputil.NewChunkedWriter(buf)
-	defer bw.Close()
-
-	events = make([]fsnotify.event)
-
-	tick := time.Tick(5 * time.Second)
-	for {
-		select {
-		case _ = <-tick :
-			atomic.AddInt64(&inotify_event_num, 1)
-
-			if len(events) == 0 {
-				if _, err := io.WriteString(bw, "PING\n"); err != nil {
-					return
-				}
-			} else {
-				files := make(map[string][]string)
-				queue := []string
-
-				for _, event := range events {
-					evt, ok := files[event.Name]
-					if !ok {
-						queue = append(queue, event.Name)
-					}
-
-					if event.Op & fsnotify.Create == fsnotify.Create ||
-						event.Op & fsnotify.Write == fsnotify.Write {
-						if len(evt) == 0 || evt[len(evt) - 1] != "SYNC" {
-							evt = append(evt, "SYNC")
-						}
-					}
-
-					if event.Op & fsnotify.Remove == fsnotify.Remove ||
-						event.Op & fsnotify.Rename == fsnotify.Rename {
-						if len(evt) == 0 || evt[len(evt) - 1] != "REMOVE" {
-							evt = append(evt, "REMOVE")
-						}
-					}
-				}
-			}
-
-			if err := buf.Flush(); err != nil {
-				return
-			}
-		case event := <-watcher.Events:
-			events = append(events, event)
-		case err := <-watcher.Errors:
-			log.Println("inotify error:", err)
-		}
-	}
-}
-
-func eventToString(evt fsnotify.Event) (msg []string) {
-	//我们只关心下面这几种事件
-	//每个事件1行进行输出
-	if evt.Op & fsnotify.Create == fsnotify.Create {
-		msg = append("CREATE:" + evt.Name)
-	}
-	if evt.Op & fsnotify.Remove == fsnotify.Remove {
-		msg = append("REMOVE:" + evt.Name)
-	}
-	if evt.Op & fsnotify.Write == fsnotify.Write {
-		msg = append("WRITE:" + evt.Name)
-	}
-	if evt.Op & fsnotify.Rename == fsnotify.Rename {
-		msg = append("RENAME:" + evt.Name)
-	}
-	return
 }
 //主服务器 结束
 
@@ -304,6 +183,8 @@ func syncAndSaveFile(r *http.Request) (http.File, error) {
 }
 
 func saveFile(filename string, t time.Time, r io.Reader) error {
+	atomic.AddInt64(&file_sync_num, 1)
+
 	name := path.Join(string(fileSystem), filename)
 
 	//创建文件夹
@@ -341,59 +222,22 @@ func saveFile(filename string, t time.Time, r io.Reader) error {
 }
 //带文件同步服务 结束
 
-//跟随master文件inotify
-func followMasterInotify() {
-	_url := followURL
-
-	req, err := http.NewRequest("INOTIFY", _url.String(), nil)
-	if err != nil {
-		log.Println(err)
-		return
-	}
-
-	resp, err := new(http.Client).Do(req)
-	if err != nil {
-		log.Println(err)
-		return
-	}
-
-	log.Println("Inotify link", _url.String())
-	defer log.Println("Inotify close")
-
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		r2 := io.LimitReader(resp.Body, 4*1024*1024)
-		msg, _ := ioutil.ReadAll(r2)
-		log.Println(resp.Status, string(msg))
-		return
-	}
-
-	r := bufio.NewReader(resp.Body)
-	for {
-		event, err := r.ReadString('\n')
-		if err != nil {
-			log.Println(err)
-			return
-		}
-		log.Println(event)
-	}
-}
-//跟随master文件inotify 结束
-
 //输出状态信息
 func requestStatus() {
 	c := time.Tick(status_time * time.Second)
 
 	for _ = range c {
 		num1 := atomic.SwapInt64(&request_num, 0)
-		num2 := atomic.SwapInt64(&inotify_event_num, 0)
-		num3 := atomic.SwapInt64(&file_sync_num, 0)
+		num2 := atomic.SwapInt64(&file_sync_num, 0)
 
 		if *follow == "" {
-			log.Println("RequestNum:", num1, "InotifyEventNum:", num2)
+			log.Println("RequestNum:", num1)
 		} else {
-			log.Println("RequestNum:", num1, "InotifyEventNum:", num2, "FileSyncNum:", num3)
+			if *syncMode == "none" {
+				log.Println("RequestNum:", num1)
+			} else {
+				log.Println("RequestNum:", num1, "FileSyncNum:", num2)
+			}
 		}
 	}
 }
