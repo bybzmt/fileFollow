@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path"
+	"net"
 	"net/http"
 	"net/url"
 	"runtime"
@@ -19,15 +20,17 @@ var base = flag.String("dir", ".", "Run on dir")
 var follow = flag.String("follow", "", "Follow master server URL")
 var syncMode = flag.String("sync", "none", "File Sync (none/lazy)")
 var statusTime = flag.Int("info", 300, "Print a status message every N*second.")
+var idleNum = flag.Int("idle", 100, "Follow idle conns num.")
 
 var fileSystem http.Dir
 var followURL url.URL
 var status_time time.Duration
-var notDelFile = false
+var idleConns int
+var file_request_num int64
 
 //状态计数
 var request_num int64
-var inotify_event_num int64
+var file_follow_num int64
 var file_sync_num int64
 
 func main() {
@@ -36,6 +39,7 @@ func main() {
 	//初史化输入参数
 	fileSystem = http.Dir(*base)
 	status_time = time.Duration(*statusTime)
+	idleConns = *idleNum
 
 	if *follow != "" {
 		_url, err := url.Parse(*follow)
@@ -57,6 +61,8 @@ func main() {
 		log.Println("Run on master mode.")
 		http.HandleFunc("/", masterServer)
 	} else {
+		go followIdleChange()
+
 		log.Println("Run on slave mode. follow", followURL.String())
 
 		switch *syncMode {
@@ -93,11 +99,25 @@ func masterServer(w http.ResponseWriter, r *http.Request) {
 func proxyServer(w http.ResponseWriter, r *http.Request) {
 	atomic.AddInt64(&request_num, 1)
 
-	_url := followURL
-	_url.Path = path.Join(_url.Path, r.URL.Path)
-	_url.RawQuery = r.URL.RawQuery
+	f, err := fileSystem.Open(r.URL.Path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			followMaster(w, r)
+		} else {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
+		return
+	}
+	defer f.Close()
 
-	resp, err := http.Get(_url.String())
+	serveContent(w, r, f)
+}
+
+func followMaster(w http.ResponseWriter, r *http.Request) {
+	atomic.AddInt64(&file_request_num, 1)
+	defer atomic.AddInt64(&file_request_num, -1)
+
+	resp, err := doHttpRequest(r.URL.Path, r.URL.RawQuery)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -156,11 +176,10 @@ func syncAndSaveFile(r *http.Request) (http.File, error) {
 		return f, nil
 	}
 
-	_url := followURL
-	_url.Path = path.Join(_url.Path, name)
-	_url.RawQuery = r.URL.RawQuery
+	atomic.AddInt64(&file_request_num, 1)
+	defer atomic.AddInt64(&file_request_num, -1)
 
-	resp, err := http.Get(_url.String())
+	resp, err := doHttpRequest(name, "")
 	if err != nil {
 		return nil, err
 	}
@@ -228,18 +247,76 @@ func requestStatus() {
 
 	for _ = range c {
 		num1 := atomic.SwapInt64(&request_num, 0)
-		num2 := atomic.SwapInt64(&file_sync_num, 0)
+		num2 := atomic.SwapInt64(&file_follow_num, 0)
+		num3 := atomic.SwapInt64(&file_sync_num, 0)
 
 		if *follow == "" {
 			log.Println("RequestNum:", num1)
 		} else {
 			if *syncMode == "none" {
-				log.Println("RequestNum:", num1)
+				log.Println("RequestNum:", num1, "FileFollowNum:", num2)
 			} else {
-				log.Println("RequestNum:", num1, "FileSyncNum:", num2)
+				log.Println("RequestNum:", num1, "FileFollowNum:", num2, "FileSyncNum:", num3)
 			}
 		}
 	}
+}
+
+func followIdleChange() {
+	c := time.Tick(1 * time.Second)
+
+	for _ = range c {
+		num := atomic.LoadInt64(&file_request_num)
+		if num < 1 {
+			//关闭空闲连接
+			transport.CloseIdleConnections()
+		}
+
+		idle := int64(transport.MaxIdleConnsPerHost)
+
+		for {
+			if num * 3 < idle {
+				idle = idle / 2
+			} else if num > idle {
+				idle = idle * 2
+			} else {
+				break;
+			}
+		}
+
+		if idle < int64(idleConns) {
+			idle = int64(idleConns)
+		}
+
+		transport.MaxIdleConnsPerHost = int(idle)
+	}
+}
+
+var transport = &http.Transport{
+	Proxy: http.ProxyFromEnvironment,
+	Dial: (&net.Dialer{
+		Timeout:   10 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}).Dial,
+	MaxIdleConnsPerHost: idleConns,
+	TLSHandshakeTimeout: 10 * time.Second,
+	ResponseHeaderTimeout: 10 * time.Second,
+}
+
+var defaultClient = &http.Client{
+	Transport:transport,
+	Timeout: 30 * time.Second,
+}
+
+//网络请求
+func doHttpRequest(name, rawQuery string) (resp *http.Response, err error) {
+	atomic.AddInt64(&file_follow_num, 1)
+
+	_url := followURL
+	_url.Path = path.Join(_url.Path, name)
+	_url.RawQuery = rawQuery
+
+	return defaultClient.Get(_url.String())
 }
 
 /** locker start **/
