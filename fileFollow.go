@@ -20,12 +20,11 @@ var base = flag.String("dir", ".", "Run on dir")
 var follow = flag.String("follow", "", "Follow master server URL")
 var syncMode = flag.String("sync", "none", "File Sync (none/lazy)")
 var statusTime = flag.Int("info", 300, "Print a status message every N*second.")
-var idleNum = flag.Int("idle", 100, "Follow idle conns num.")
 
 var fileSystem http.Dir
 var followURL url.URL
 var status_time time.Duration
-var idleConns int
+var idleConns = 32
 var file_request_num int64
 
 //状态计数
@@ -39,7 +38,6 @@ func main() {
 	//初史化输入参数
 	fileSystem = http.Dir(*base)
 	status_time = time.Duration(*statusTime)
-	idleConns = *idleNum
 
 	if *follow != "" {
 		_url, err := url.Parse(*follow)
