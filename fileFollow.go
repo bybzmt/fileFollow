@@ -20,12 +20,11 @@ var base = flag.String("dir", ".", "Run on dir")
 var follow = flag.String("follow", "", "Follow master server URL")
 var syncMode = flag.String("sync", "none", "File Sync (none/lazy)")
 var statusTime = flag.Int("info", 300, "Print a status message every N*second.")
+var idleConns = flag.Int("idle", 500, "MaxIdleConnsPerHost")
 
 var fileSystem http.Dir
 var followURL url.URL
 var status_time time.Duration
-var idleConns = 32
-var file_request_num int64
 
 //状态计数
 var request_num int64
@@ -59,8 +58,6 @@ func main() {
 		log.Println("Run on master mode.")
 		http.HandleFunc("/", masterServer)
 	} else {
-		go followIdleChange()
-
 		log.Println("Run on slave mode. follow", followURL.String())
 
 		switch *syncMode {
@@ -112,9 +109,6 @@ func proxyServer(w http.ResponseWriter, r *http.Request) {
 }
 
 func followMaster(w http.ResponseWriter, r *http.Request) {
-	atomic.AddInt64(&file_request_num, 1)
-	defer atomic.AddInt64(&file_request_num, -1)
-
 	resp, err := doHttpRequest(r.URL.Path, r.URL.RawQuery)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -173,9 +167,6 @@ func syncAndSaveFile(r *http.Request) (http.File, error) {
 	if f, err := fileSystem.Open(name); err == nil {
 		return f, nil
 	}
-
-	atomic.AddInt64(&file_request_num, 1)
-	defer atomic.AddInt64(&file_request_num, -1)
 
 	resp, err := doHttpRequest(name, "")
 	if err != nil {
@@ -260,50 +251,20 @@ func requestStatus() {
 	}
 }
 
-func followIdleChange() {
-	c := time.Tick(1 * time.Second)
-
-	for _ = range c {
-		num := atomic.LoadInt64(&file_request_num)
-		if num < 1 {
-			//关闭空闲连接
-			transport.CloseIdleConnections()
-		}
-
-		idle := int64(transport.MaxIdleConnsPerHost)
-
-		for {
-			if num * 3 < idle {
-				idle = idle / 2
-			} else if num > idle {
-				idle = idle * 2
-			} else {
-				break;
-			}
-		}
-
-		if idle < int64(idleConns) {
-			idle = int64(idleConns)
-		}
-
-		transport.MaxIdleConnsPerHost = int(idle)
-	}
-}
-
 var transport = &http.Transport{
 	Proxy: http.ProxyFromEnvironment,
 	Dial: (&net.Dialer{
 		Timeout:   10 * time.Second,
 		KeepAlive: 30 * time.Second,
 	}).Dial,
-	MaxIdleConnsPerHost: idleConns,
+	MaxIdleConnsPerHost: *idleConns,
 	TLSHandshakeTimeout: 10 * time.Second,
 	ResponseHeaderTimeout: 10 * time.Second,
 }
 
 var defaultClient = &http.Client{
 	Transport:transport,
-	Timeout: 30 * time.Second,
+	Timeout: 60 * time.Second,
 }
 
 //网络请求
